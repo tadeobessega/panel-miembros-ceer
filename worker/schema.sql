@@ -9,7 +9,10 @@ CREATE TABLE IF NOT EXISTS usuarios (
   activo        INTEGER NOT NULL DEFAULT 1,
   fallos        INTEGER NOT NULL DEFAULT 0,
   bloqueo_hasta INTEGER NOT NULL DEFAULT 0, -- epoch ms
-  creado        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  creado        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  github        TEXT,                       -- usuario de GitHub que carga cada miembro en /perfil
+  github_estado TEXT,                       -- resultado de la última revisión de acceso a los repos
+  github_revisado INTEGER NOT NULL DEFAULT 0 -- epoch ms
 );
 CREATE TABLE IF NOT EXISTS sesiones (
   token_hash TEXT PRIMARY KEY,              -- SHA-256 del token de la cookie
@@ -24,6 +27,7 @@ CREATE TABLE IF NOT EXISTS accesos (
   descripcion TEXT NOT NULL DEFAULT '',
   url         TEXT NOT NULL,
   tipo        TEXT NOT NULL DEFAULT '',
+  repo        TEXT,                         -- dueño/nombre en GitHub (para el enlace "repo")
   estado      TEXT NOT NULL DEFAULT 'activo', -- 'activo' | 'pendiente'
   orden       INTEGER NOT NULL DEFAULT 0
 );

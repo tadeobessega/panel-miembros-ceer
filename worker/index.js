@@ -1,6 +1,9 @@
 /* Panel de miembros del CEER (Cloudflare Worker + D1).
    Todo se arma en el servidor: sin sesión válida no sale ningún enlace.
-   Rutas: /login, /salir, / (accesos), /clave (cambiar clave), /admin (miembros y accesos). */
+   Rutas: /login, /salir, / (accesos), /perfil (GitHub), /clave (cambiar clave), /admin (miembros y accesos),
+   /intercambio-comercial-provincial (página servida desde public/, solo con sesión). */
+
+import { usuarioGitHub, darAcceso, quitarAcceso, estadoBackups, DUENO } from './github.js';
 
 const SESION_DIAS = 30;
 const ITER = 100000;
@@ -13,6 +16,8 @@ export default {
     const url = new URL(request.url);
     try {
       if (request.method === 'POST' && !mismoOrigen(request, url)) return texto('Origen no permitido', 403);
+      const pag = PAGINAS.find((x) => url.pathname === x || url.pathname.startsWith(x + '/'));
+      if (pag) return await paginaInterna(request, env, url, pag);
       const r = RUTAS[url.pathname];
       if (!r) return redirigir('/');
       return await r(request, env, url);
@@ -20,14 +25,47 @@ export default {
       console.error(e);
       return pagina({ titulo: 'Error', cuerpo: aviso('Algo salió mal', 'Probá de nuevo en un rato.') }, 500);
     }
+  },
+
+  /* Cada hora: revisa el acceso a GitHub del miembro que hace más tiempo que no se revisa
+     (uno por corrida, para no pasar el límite de pedidos de Cloudflare). Así los repos nuevos
+     también les llegan a todos. */
+  async scheduled(event, env, ctx) {
+    if (!env.GITHUB_TOKEN) return;
+    const m = await env.DB.prepare(
+      "SELECT usuario, github, activo FROM usuarios WHERE github IS NOT NULL AND github != '' ORDER BY github_revisado LIMIT 1"
+    ).first();
+    if (!m) return;
+    let estado;
+    try {
+      if (m.activo) estado = await darAcceso(env, m.github);
+      else { await quitarAcceso(env, m.github); estado = 'Sin acceso (cuenta desactivada)'; }
+    } catch (e) { estado = 'Error al revisar: ' + e.message; }
+    await env.DB.prepare('UPDATE usuarios SET github_estado = ?, github_revisado = ? WHERE usuario = ?')
+      .bind(estado, Date.now(), m.usuario).run();
   }
 };
+
+/* Páginas del CEER que se publican dentro del panel (archivos en public/<ruta>/index.html). */
+const PAGINAS = ['/intercambio-comercial-provincial'];
+
+async function paginaInterna(request, env, url, pag) {
+  const { respuesta } = await exigir(request, env);
+  if (respuesta) return respuesta;
+  if (url.pathname === pag) return redirigir(pag + '/');
+  const r = await env.ASSETS.fetch(new Request(new URL(url.pathname, url.origin), request));
+  const h = new Headers(r.headers);
+  h.set('cache-control', 'private, no-store');
+  h.set('x-robots-tag', 'noindex');
+  return new Response(r.body, { status: r.status, headers: h });
+}
 
 const RUTAS = {
   '/': panel,
   '/login': login,
   '/salir': salir,
   '/clave': clave,
+  '/perfil': perfil,
   '/admin': admin,
   '/favicon.ico': async () => new Response(null, { status: 204 })
 };
@@ -136,6 +174,61 @@ async function clave(request, env) {
   return redirigir('/?ok=clave');
 }
 
+async function perfil(request, env) {
+  const { u, respuesta } = await exigir(request, env);
+  if (respuesta) return respuesta;
+  let msj = '';
+  if (request.method === 'POST') {
+    const f = await request.formData();
+    const pedido = String(f.get('github') || '').trim().replace(/^@/, '').replace(/^https?:\/\/github\.com\//i, '').replace(/\/.*$/, '');
+    if (!pedido) {
+      if (u.github) await quitarAcceso(env, u.github);
+      await env.DB.prepare('UPDATE usuarios SET github = NULL, github_estado = NULL WHERE usuario = ?').bind(u.usuario).run();
+      u.github = null; u.github_estado = null;
+      msj = ok('Sacaste tu usuario de GitHub del panel.');
+    } else {
+      let login = null, falla = '';
+      try { login = await usuarioGitHub(env, pedido); } catch (e) { falla = e.message; }
+      if (falla) {
+        msj = error(falla);
+      } else if (!login) {
+        msj = error(`No encontramos el usuario de GitHub "${pedido}".`);
+      } else {
+        const ocupado = await env.DB.prepare('SELECT nombre FROM usuarios WHERE lower(github) = lower(?) AND usuario != ?').bind(login, u.usuario).first();
+        if (ocupado) msj = error(`Ese usuario de GitHub ya está cargado por ${ocupado.nombre}.`);
+        else {
+          if (u.github && u.github.toLowerCase() !== login.toLowerCase()) await quitarAcceso(env, u.github);
+          let estado;
+          try { estado = await darAcceso(env, login); } catch (e) { estado = 'Error: ' + e.message; }
+          await env.DB.prepare('UPDATE usuarios SET github = ?, github_estado = ?, github_revisado = ? WHERE usuario = ?')
+            .bind(login, estado, Date.now(), u.usuario).run();
+          u.github = login; u.github_estado = estado;
+          msj = ok('Guardado.');
+        }
+      }
+    }
+  }
+  const cuerpo = `
+    <h1>Tu perfil</h1>
+    <p class="bajada">${esc(u.nombre)} · usuario <span class="mono">${esc(u.usuario)}</span></p>
+    ${msj}
+    <section><h2>GitHub</h2>
+      <div class="caja">
+        <p class="texto">Cargá tu usuario de GitHub y te damos permiso de edición en todos los repos del CEER. GitHub te manda una invitación por mail para cada repo: hasta que la aceptes no vas a poder editar.</p>
+        <form method="post" action="/perfil" class="form fila">
+          <label>Usuario de GitHub<input name="github" value="${esc(u.github || '')}" placeholder="tu-usuario" autocapitalize="none" spellcheck="false"></label>
+          <div class="botones"><button class="boton" type="submit">Guardar</button></div>
+        </form>
+        ${u.github ? `<p class="estado-gh"><a href="https://github.com/${esc(u.github)}" target="_blank" rel="noopener" class="mono">github.com/${esc(u.github)}</a> · ${esc(u.github_estado || 'sin revisar')}</p>
+          <p class="estado-gh"><a href="https://github.com/notifications" target="_blank" rel="noopener">Ver invitaciones pendientes en GitHub ↗</a></p>` : ''}
+      </div>
+    </section>
+    <section><h2>Contraseña</h2>
+      <div class="caja"><p class="texto">Al cambiarla se cierran tus otras sesiones abiertas.</p><a class="boton" href="/clave">Cambiar contraseña</a></div>
+    </section>`;
+  return pagina({ titulo: 'Perfil', u, activa: '/perfil', cuerpo });
+}
+
 async function admin(request, env, url) {
   const { u, respuesta } = await exigir(request, env, { admin: true });
   if (respuesta) return respuesta;
@@ -171,23 +264,40 @@ async function admin(request, env, url) {
         mensaje = claveMostrada(m.nombre, usuario, temp, 'restablecido');
         break;
       }
+      case 'github': {
+        const m = await db.prepare('SELECT * FROM usuarios WHERE usuario = ?').bind(usuario).first();
+        if (!m || !m.github) break;
+        let estado;
+        try { estado = m.activo ? await darAcceso(env, m.github) : 'Sin acceso (cuenta desactivada)'; } catch (e) { estado = 'Error: ' + e.message; }
+        await db.prepare('UPDATE usuarios SET github_estado = ?, github_revisado = ? WHERE usuario = ?').bind(estado, Date.now(), usuario).run();
+        mensaje = ok(`GitHub de ${m.nombre}: ${estado}`);
+        break;
+      }
       case 'activar':
-      case 'desactivar':
+      case 'desactivar': {
         if (usuario === u.usuario) { mensaje = error('No podés desactivar tu propia cuenta.'); break; }
+        const m = await db.prepare('SELECT github FROM usuarios WHERE usuario = ?').bind(usuario).first();
+        if (m && m.github) {
+          try { if (accion === 'desactivar') await quitarAcceso(env, m.github); else await darAcceso(env, m.github); } catch {}
+        }
         await db.batch([
           db.prepare('UPDATE usuarios SET activo = ? WHERE usuario = ?').bind(accion === 'activar' ? 1 : 0, usuario),
           db.prepare('DELETE FROM sesiones WHERE usuario = ?').bind(usuario)
         ]);
-        mensaje = ok(accion === 'activar' ? 'Cuenta activada.' : 'Cuenta desactivada.');
+        mensaje = ok(accion === 'activar' ? 'Cuenta activada.' : 'Cuenta desactivada y sin acceso a los repos.');
         break;
-      case 'eliminar':
+      }
+      case 'eliminar': {
         if (usuario === u.usuario) { mensaje = error('No podés eliminar tu propia cuenta.'); break; }
+        const m = await db.prepare('SELECT github FROM usuarios WHERE usuario = ?').bind(usuario).first();
+        if (m && m.github) { try { await quitarAcceso(env, m.github); } catch {} }
         await db.batch([
           db.prepare('DELETE FROM sesiones WHERE usuario = ?').bind(usuario),
           db.prepare('DELETE FROM usuarios WHERE usuario = ?').bind(usuario)
         ]);
         mensaje = ok('Cuenta eliminada.');
         break;
+      }
       case 'acceso-guardar': {
         const d = {
           seccion: String(f.get('seccion') || '').trim(),
@@ -195,18 +305,20 @@ async function admin(request, env, url) {
           descripcion: String(f.get('descripcion') || '').trim(),
           url: String(f.get('url') || '').trim(),
           tipo: String(f.get('tipo') || '').trim(),
+          repo: String(f.get('repo') || '').trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\/$/, ''),
           estado: f.get('estado') === 'pendiente' ? 'pendiente' : 'activo',
           orden: parseInt(f.get('orden'), 10) || 0
         };
         if (!d.seccion || !d.titulo || !/^(https?:\/\/|\/)/.test(d.url)) { mensaje = error('Completá sección, título y un enlace que empiece con https://.'); break; }
+        if (d.repo && !/^[\w.-]+\/[\w.-]+$/.test(d.repo)) { mensaje = error('El repo va como dueño/nombre, por ejemplo tadeobessega/ipceer.'); break; }
         const id = parseInt(f.get('id'), 10);
         if (id) {
-          await db.prepare('UPDATE accesos SET seccion=?, titulo=?, descripcion=?, url=?, tipo=?, estado=?, orden=? WHERE id=?')
-            .bind(d.seccion, d.titulo, d.descripcion, d.url, d.tipo, d.estado, d.orden, id).run();
+          await db.prepare('UPDATE accesos SET seccion=?, titulo=?, descripcion=?, url=?, tipo=?, repo=?, estado=?, orden=? WHERE id=?')
+            .bind(d.seccion, d.titulo, d.descripcion, d.url, d.tipo, d.repo || null, d.estado, d.orden, id).run();
           mensaje = ok('Acceso guardado.');
         } else {
-          await db.prepare('INSERT INTO accesos (seccion, titulo, descripcion, url, tipo, estado, orden) VALUES (?,?,?,?,?,?,?)')
-            .bind(d.seccion, d.titulo, d.descripcion, d.url, d.tipo, d.estado, d.orden).run();
+          await db.prepare('INSERT INTO accesos (seccion, titulo, descripcion, url, tipo, repo, estado, orden) VALUES (?,?,?,?,?,?,?,?)')
+            .bind(d.seccion, d.titulo, d.descripcion, d.url, d.tipo, d.repo || null, d.estado, d.orden).run();
           mensaje = ok('Acceso agregado.');
         }
         break;
@@ -219,23 +331,25 @@ async function admin(request, env, url) {
   }
   const { results: miembros } = await env.DB.prepare('SELECT * FROM usuarios ORDER BY rol = \'admin\' DESC, nombre').all();
   const { results: accesos } = await env.DB.prepare('SELECT * FROM accesos ORDER BY orden, id').all();
-  return pagina({ titulo: 'Administración', u, activa: '/admin', cuerpo: vistaAdmin(u, miembros, accesos, mensaje) });
+  const backups = await estadoBackups();
+  return pagina({ titulo: 'Administración', u, activa: '/admin', cuerpo: vistaAdmin(u, miembros, accesos, mensaje, backups, !!env.GITHUB_TOKEN) });
 }
 
 /* ---------------- vistas ---------------- */
 function tarjetaAcceso(a) {
   const externo = /^https?:/.test(a.url);
   const pend = a.estado === 'pendiente';
-  return `<a class="acceso${pend ? ' pendiente' : ''}" href="${esc(a.url)}"${externo ? ' target="_blank" rel="noopener"' : ''}>
+  const repo = a.repo ? `<a class="repo" href="https://github.com/${esc(a.repo)}" target="_blank" rel="noopener" title="Repo en GitHub: ${esc(a.repo)}">repo <span aria-hidden="true">↗</span></a>` : '';
+  return `<div class="acceso${pend ? ' pendiente' : ''}">
     <div class="tipo"><span>${esc(a.tipo)}</span>${pend ? '<span class="etiqueta">Pendiente</span>' : ''}</div>
-    <h3>${esc(a.titulo)}</h3><p>${esc(a.descripcion)}</p>
-    <div class="destino">${esc(host(a.url))}</div></a>`;
+    <h3><a class="principal" href="${esc(a.url)}"${externo ? ' target="_blank" rel="noopener"' : ''}>${esc(a.titulo)}</a></h3>
+    <p>${esc(a.descripcion)}</p>
+    <div class="pie-acceso"><span class="destino">${esc(host(a.url))}</span>${repo}</div></div>`;
 }
 
 function formLogin(usuario = '', err = '') {
   return `<div class="caja angosta">
-    <h1 class="chico">Iniciar sesión</h1>
-    <p class="bajada">Entrá con el usuario y la contraseña que te pasó el coordinador del CEER.</p>
+    <h1 class="chico espacio">Iniciar sesión</h1>
     ${err ? `<p class="msj error">${esc(err)}</p>` : ''}
     <form method="post" action="/login" class="form">
       <label>Usuario<input name="usuario" autocomplete="username" autocapitalize="none" required value="${esc(usuario)}"></label>
@@ -258,7 +372,7 @@ function formClave(u, err = '') {
     </form></div>`;
 }
 
-function vistaAdmin(u, miembros, accesos, mensaje) {
+function vistaAdmin(u, miembros, accesos, mensaje, backups, conToken) {
   const filas = miembros.map((m) => {
     const yo = m.usuario === u.usuario;
     const estado = !m.activo ? 'Desactivada' : m.debe_cambiar ? 'Falta cambiar la clave' : 'Activa';
@@ -268,7 +382,8 @@ function vistaAdmin(u, miembros, accesos, mensaje) {
     return `<tr${m.activo ? '' : ' class="inactiva"'}>
       <td><strong>${esc(m.nombre)}</strong></td><td class="mono">${esc(m.usuario)}</td>
       <td>${m.rol === 'admin' ? 'Administrador' : 'Miembro'}</td><td>${estado}</td>
-      <td><div class="acciones">${btn('restablecer', 'Restablecer clave', `¿Generar una clave nueva para ${esc(m.nombre)}?`)}
+      <td>${m.github ? `<a class="mono" href="https://github.com/${esc(m.github)}" target="_blank" rel="noopener">${esc(m.github)}</a><div class="estado-gh">${esc(m.github_estado || 'sin revisar')}</div>` : '<span class="estado-gh">sin cargar</span>'}</td>
+      <td><div class="acciones">${m.github ? btn('github', 'Revisar GitHub') : ''}${btn('restablecer', 'Restablecer clave', `¿Generar una clave nueva para ${esc(m.nombre)}?`)}
         ${yo ? '' : btn(m.activo ? 'desactivar' : 'activar', m.activo ? 'Desactivar' : 'Activar')}
         ${yo ? '' : btn('eliminar', 'Eliminar', `¿Eliminar la cuenta de ${esc(m.nombre)}?`)}</div></td></tr>`;
   }).join('');
@@ -278,6 +393,7 @@ function vistaAdmin(u, miembros, accesos, mensaje) {
       <label>Sección<input name="seccion" required value="${esc(a.seccion || '')}" list="secciones"></label>
       <label>Título<input name="titulo" required value="${esc(a.titulo || '')}"></label>
       <label>Tipo<input name="tipo" value="${esc(a.tipo || '')}" placeholder="Tablero, Drive…"></label>
+      <label>Repo<input name="repo" value="${esc(a.repo || '')}" placeholder="tadeobessega/nombre"></label>
       <label class="ancho">Descripción<input name="descripcion" value="${esc(a.descripcion || '')}"></label>
       <label class="ancho">Enlace<input name="url" required value="${esc(a.url || '')}" placeholder="https://"></label>
       <label>Estado<select name="estado"><option value="activo">Activo</option><option value="pendiente"${a.estado === 'pendiente' ? ' selected' : ''}>Pendiente</option></select></label>
@@ -294,7 +410,7 @@ function vistaAdmin(u, miembros, accesos, mensaje) {
     <p class="bajada">Cuentas de los miembros y enlaces del panel. Las claves nuevas se muestran una sola vez: pasáselas a cada miembro por un canal privado.</p>
     ${mensaje}
     <section><h2>Miembros</h2>
-      <div class="tabla"><table><thead><tr><th>Nombre</th><th>Usuario</th><th>Rol</th><th>Estado</th><th></th></tr></thead><tbody>${filas}</tbody></table></div>
+      <div class="tabla"><table><thead><tr><th>Nombre</th><th>Usuario</th><th>Rol</th><th>Estado</th><th>GitHub</th><th></th></tr></thead><tbody>${filas}</tbody></table></div>
       <h3 class="sub">Agregar miembro</h3>
       <form method="post" action="/admin" class="form fila">
         <input type="hidden" name="accion" value="crear">
@@ -304,12 +420,23 @@ function vistaAdmin(u, miembros, accesos, mensaje) {
         <div class="botones"><button class="boton" type="submit">Crear cuenta</button></div>
       </form>
     </section>
+    ${conToken ? '' : `<p class="msj error">Para dar acceso a los repos falta el token de GitHub: en Cloudflare, Worker panel-miembros-ceer, Settings, Variables and Secrets, agregá un secreto <span class="mono">GITHUB_TOKEN</span> con un token de ${DUENO} que pueda administrar colaboradores (classic con permiso repo, o fine-grained con Administration: read and write en todos los repos).</p>`}
+    <section><h2>Backups de los repos</h2>${vistaBackups(backups)}</section>
     <section><h2>Accesos</h2>
       <datalist id="secciones">${secciones.map((s) => `<option value="${esc(s)}">`).join('')}</datalist>
       ${accesos.map((a) => `<div class="caja editor">${formAcceso(a)}</div>`).join('')}
       <h3 class="sub">Agregar acceso</h3>
       <div class="caja editor">${formAcceso()}</div>
     </section>`;
+}
+
+function vistaBackups(b) {
+  if (!b || !b.repos) return `<div class="caja"><p class="texto sin">Todavía no hay backups. Los hace la PC todos los días después de la tarea del IPCEER (scripts/backup_repos.ps1) y los guarda en OneDrive.</p></div>`;
+  const filas = b.repos.map((r) => `<tr><td class="mono">${esc(r.repo)}</td><td>${esc(r.ultimo_backup ? r.ultimo_backup.split('-').reverse().join('/') : '')}</td>
+    <td class="num mono">${esc(String(r.copias))}</td><td class="num mono">${esc(String(r.mb).replace('.', ','))}</td><td>${esc(r.estado)}</td></tr>`).join('');
+  const f = String(b.corrida || '');
+  return `<p class="texto">Última corrida: <span class="mono">${esc(f.slice(8, 10) + '/' + f.slice(5, 7) + '/' + f.slice(0, 4) + ' ' + f.slice(11, 16))}</span> en la PC ${esc(b.pc || '')}. Carpeta: <span class="mono">${esc(b.carpeta || '')}</span>. Se guarda un .bundle con toda la historia cuando el repo cambia; quedan los últimos 30 días y el primero de cada mes. Para restaurar: <span class="mono">git clone archivo.bundle carpeta</span>.</p>
+    <div class="tabla"><table><thead><tr><th>Repo</th><th>Último backup</th><th class="num">Copias</th><th class="num">MB</th><th>Estado</th></tr></thead><tbody>${filas}</tbody></table></div>`;
 }
 
 const ok = (t) => `<p class="msj ok">${esc(t)}</p>`;
@@ -328,7 +455,7 @@ function pagina({ titulo, u = null, activa = '', cuerpo }, status = 200) {
   const nav = u ? `<nav>
       <a href="/"${activa === '/' ? ' class="activa"' : ''}>Accesos</a>
       ${u.rol === 'admin' ? `<a href="/admin"${activa === '/admin' ? ' class="activa"' : ''}>Administración</a>` : ''}
-      <a href="/clave" class="ocultable${activa === '/clave' ? ' activa' : ''}" title="Cambiar contraseña">${esc(u.nombre.split(' ')[0])}</a>
+      <a href="/perfil" class="${activa === '/perfil' ? 'activa' : ''}" title="Tu perfil: GitHub y contraseña">${esc(u.nombre.split(' ')[0])}</a>
       <form method="post" action="/salir"><button type="submit">Salir</button></form>
     </nav>` : '';
   const html = `<!DOCTYPE html>
@@ -394,19 +521,26 @@ main{flex:1 0 auto;padding:48px 0 64px}
 main .contenedor > :last-child, section:last-child{margin-bottom:0}
 h1{margin:0 0 16px;font-family:var(--mono);font-weight:700;font-size:44px;line-height:52px;letter-spacing:-.01em}
 h1.chico{font-size:32px;line-height:40px}
+h1.espacio{margin-bottom:24px}
+.estado-gh{font-size:13px;color:var(--n600);margin-top:4px}
 .bajada{margin:0 0 40px;font-size:18px;line-height:28px;color:var(--n600)}
 .bajada.sin{margin:0}
 section{margin:0 0 48px}
 h2{margin:0 0 20px;font-family:var(--mono);font-weight:700;font-size:26px;line-height:32px}
 h3.sub{margin:32px 0 12px;font-family:var(--mono);font-weight:700;font-size:18px;line-height:24px}
 .accesos{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
-.acceso{display:flex;flex-direction:column;background:#fff;border:1px solid var(--n200);padding:24px;text-decoration:none;min-height:190px;transition:border-color .15s}
-.acceso:hover,.acceso:focus-visible{border-color:var(--azul-600);outline:none}
-.acceso:hover h3,.acceso:focus-visible h3{text-decoration:underline;text-decoration-color:var(--azul-600);text-underline-offset:4px}
+.acceso{position:relative;display:flex;flex-direction:column;background:#fff;border:1px solid var(--n200);padding:24px;min-height:190px;transition:border-color .15s}
+.acceso:hover,.acceso:focus-within{border-color:var(--azul-600)}
+.acceso .principal{text-decoration:none;outline:none}
+.acceso .principal::after{content:"";position:absolute;inset:0}
+.acceso:hover h3,.acceso .principal:focus-visible{text-decoration:underline;text-decoration-color:var(--azul-600);text-underline-offset:4px}
+.acceso .pie-acceso{margin-top:auto;padding-top:16px;display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.acceso .repo{position:relative;z-index:1;flex-shrink:0;font-family:var(--mono);font-size:13px;color:var(--n600);text-decoration:none;padding:2px 0;border-bottom:1px solid var(--n200)}
+.acceso .repo:hover,.acceso .repo:focus-visible{color:var(--azul-600);border-bottom-color:var(--azul-600);outline:none}
 .acceso .tipo{font-size:13px;line-height:18px;height:22px;color:var(--n600);margin:0 0 8px;display:flex;justify-content:space-between;align-items:center;gap:8px}
 .acceso h3{margin:0 0 8px;font-family:var(--mono);font-weight:700;font-size:20px;line-height:26px}
 .acceso p{margin:0;font-size:15px;line-height:22px;color:var(--n600)}
-.acceso .destino{margin-top:auto;padding-top:16px;font-family:var(--mono);font-size:13px;color:var(--azul-600);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acceso .destino{min-width:0;font-family:var(--mono);font-size:13px;color:var(--azul-600);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .acceso .destino::before{content:"// ";color:var(--cian-700)}
 .acceso.pendiente{border-style:dashed}
 .etiqueta{font-size:12px;font-weight:600;line-height:1;padding:5px 8px;background:var(--lima-300);color:var(--tinta)}
@@ -435,6 +569,9 @@ th{text-align:left;font-size:13px;font-weight:600;color:var(--n600);padding:12px
 td{padding:12px 16px;border-bottom:1px solid var(--n200);vertical-align:middle}
 tr:last-child td{border-bottom:0}
 tr.inactiva td{color:var(--n400)}
+th.num,td.num{text-align:right}
+.texto{margin:0 0 16px;font-size:15px;color:var(--n600)}
+.texto.sin{margin:0}
 .acciones{display:flex;gap:16px;justify-content:flex-end;white-space:nowrap}
 .acciones form{margin:0}
 footer{flex-shrink:0;background:var(--azul-600);color:#fff}
