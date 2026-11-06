@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "panel-miembros-ceer",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-11-01",
+  "d1_databases": [
+    { "binding": "DB", "database_name": "panel-miembros-ceer-db", "database_id": "69759d89-e842-4122-b5b8-b14bb2ad2e6e" }
+  ],
+  "observability": { "enabled": true }
+}
