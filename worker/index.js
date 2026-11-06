@@ -268,9 +268,9 @@ function vistaAdmin(u, miembros, accesos, mensaje) {
     return `<tr${m.activo ? '' : ' class="inactiva"'}>
       <td><strong>${esc(m.nombre)}</strong></td><td class="mono">${esc(m.usuario)}</td>
       <td>${m.rol === 'admin' ? 'Administrador' : 'Miembro'}</td><td>${estado}</td>
-      <td class="acciones">${btn('restablecer', 'Restablecer clave', `¿Generar una clave nueva para ${esc(m.nombre)}?`)}
+      <td><div class="acciones">${btn('restablecer', 'Restablecer clave', `¿Generar una clave nueva para ${esc(m.nombre)}?`)}
         ${yo ? '' : btn(m.activo ? 'desactivar' : 'activar', m.activo ? 'Desactivar' : 'Activar')}
-        ${yo ? '' : btn('eliminar', 'Eliminar', `¿Eliminar la cuenta de ${esc(m.nombre)}?`)}</td></tr>`;
+        ${yo ? '' : btn('eliminar', 'Eliminar', `¿Eliminar la cuenta de ${esc(m.nombre)}?`)}</div></td></tr>`;
   }).join('');
 
   const formAcceso = (a = {}) => `<form method="post" action="/admin" class="form acceso-form">
@@ -435,8 +435,8 @@ th{text-align:left;font-size:13px;font-weight:600;color:var(--n600);padding:12px
 td{padding:12px 16px;border-bottom:1px solid var(--n200);vertical-align:middle}
 tr:last-child td{border-bottom:0}
 tr.inactiva td{color:var(--n400)}
-td.acciones{display:flex;gap:16px;justify-content:flex-end;white-space:nowrap}
-td.acciones form{margin:0}
+.acciones{display:flex;gap:16px;justify-content:flex-end;white-space:nowrap}
+.acciones form{margin:0}
 footer{flex-shrink:0;background:var(--azul-600);color:#fff}
 footer .contenedor{min-height:96px;display:flex;align-items:center;justify-content:space-between;gap:24px;flex-wrap:wrap;padding-top:24px;padding-bottom:24px}
 footer .firma{display:flex;align-items:baseline;gap:12px;font-size:15px}
