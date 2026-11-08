@@ -83,14 +83,47 @@ export async function quitarAcceso(env, login) {
   }
 }
 
-/* Estado de los backups que sube la PC (scripts/backup_repos.ps1 del repo ipceer). */
-export async function estadoBackups() {
-  try {
-    const r = await fetch(`https://github.com/${DUENO}/ipceer/releases/download/sepa-archivo/estado_backups.json`,
-      { redirect: 'follow', cf: { cacheTtl: 300, cacheEverything: true } });
+/* Baja un archivo de un release. Con token funciona aunque el repo sea privado: se pide el asset por la API
+   y se sigue a mano la redirección a la URL firmada (sin mandar el token a otro dominio). */
+export async function assetRelease(env, repo, tag, nombre) {
+  if (env.GITHUB_TOKEN) {
+    const r = await gh(env, `/repos/${DUENO}/${repo}/releases/tags/${tag}`);
     if (!r.ok) return null;
-    return JSON.parse((await r.text()).replace(/^﻿/, ''));
+    const a = ((await r.json()).assets || []).find((x) => x.name === nombre);
+    if (!a) return null;
+    const d = await gh(env, `/repos/${DUENO}/${repo}/releases/assets/${a.id}`, { headers: { accept: 'application/octet-stream' }, redirect: 'manual' });
+    if (d.status >= 300 && d.status < 400 && d.headers.get('location')) return fetch(d.headers.get('location'));
+    return d.ok ? d : null;
+  }
+  const r = await fetch(`https://github.com/${DUENO}/${repo}/releases/download/${tag}/${nombre}`, { redirect: 'follow' });
+  return r.ok ? r : null;
+}
+
+/* Estado de los backups que sube la PC (scripts/backup_repos.ps1 del repo ipceer). */
+export async function estadoBackups(env) {
+  try {
+    const r = await assetRelease(env, 'ipceer', 'sepa-archivo', 'estado_backups.json');
+    if (!r) return null;
+    return JSON.parse((await r.text()).replace(/^\uFEFF/, ''));
   } catch {
     return null;
   }
+}
+
+/* Chequeo del token (sin datos sensibles): si está, si es válido, de quién es y si puede administrar los repos. */
+export async function chequeoToken(env) {
+  if (!env.GITHUB_TOKEN) return { token: false };
+  const u = await gh(env, '/user');
+  if (!u.ok) return { token: true, valido: false, status: u.status };
+  const login = (await u.json()).login;
+  let repos = [], error = null;
+  try { repos = await reposDeLaCuenta(env); } catch (e) { error = e.message; }
+  let privados = 0, conAdmin = 0;
+  for (const repo of repos) {
+    const r = await gh(env, `/repos/${DUENO}/${repo}`);
+    const d = r.ok ? await r.json() : null;
+    if (d && d.private) privados++; if (d && d.permissions && d.permissions.admin) conAdmin++;
+  }
+  const b = await assetRelease(env, 'ipceer', 'sepa-archivo', 'estado_backups.json');
+  return { token: true, valido: true, cuenta: login, es_dueno: (login || '').toLowerCase() === DUENO, repos: repos.length, privados, con_permiso_admin: conAdmin, backups_legibles: !!b, error };
 }

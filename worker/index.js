@@ -3,7 +3,7 @@
    Rutas: /login, /salir, / (accesos), /perfil (GitHub), /clave (cambiar clave), /admin (miembros y accesos),
    /intercambio-comercial-provincial (página servida desde public/, solo con sesión). */
 
-import { usuarioGitHub, darAcceso, quitarAcceso, estadoBackups, DUENO } from './github.js';
+import { usuarioGitHub, darAcceso, quitarAcceso, estadoBackups, chequeoToken, DUENO } from './github.js';
 
 const SESION_DIAS = 30;
 const ITER = 100000;
@@ -67,6 +67,7 @@ const RUTAS = {
   '/clave': clave,
   '/perfil': perfil,
   '/admin': admin,
+  '/estado-github': async (request, env) => new Response(JSON.stringify(await chequeoToken(env), null, 1), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } }),
   '/favicon.ico': async () => new Response(null, { status: 204 })
 };
 
@@ -331,7 +332,7 @@ async function admin(request, env, url) {
   }
   const { results: miembros } = await env.DB.prepare('SELECT * FROM usuarios ORDER BY rol = \'admin\' DESC, nombre').all();
   const { results: accesos } = await env.DB.prepare('SELECT * FROM accesos ORDER BY orden, id').all();
-  const backups = await estadoBackups();
+  const backups = await estadoBackups(env);
   return pagina({ titulo: 'Administración', u, activa: '/admin', cuerpo: vistaAdmin(u, miembros, accesos, mensaje, backups, !!env.GITHUB_TOKEN) });
 }
 
