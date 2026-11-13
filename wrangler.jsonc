@@ -9,8 +9,8 @@
   ],
   // Páginas del CEER publicadas dentro del panel: el Worker pide sesión antes de servirlas
   "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
-  // Revisión horaria del acceso a GitHub (un miembro por corrida)
-  "triggers": { "crons": ["17 * * * *"] },
+  // Revisión horaria del acceso a GitHub (un miembro por corrida) y, cada 5 minutos, disparo de los datos del INDEC
+  "triggers": { "crons": ["17 * * * *", "1,6,11,16,21,26,31,36,41,46,51,56 * * * *"] },
   // El token de GitHub va como secreto (GITHUB_TOKEN), nunca en este archivo
   "observability": { "enabled": true }
 }

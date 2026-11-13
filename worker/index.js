@@ -14,6 +14,24 @@ const COOKIE = '__Host-ceer_panel';
 /* El secreto se cargó en Cloudflare como GITHUB_TOKEM (con M). Se acepta ese nombre para no tener que volver a generar el token. */
 function nombreToken(env) { if (!env.GITHUB_TOKEN && env.GITHUB_TOKEM) env.GITHUB_TOKEN = env.GITHUB_TOKEM; }
 
+/* Datos del INDEC (repo publicaciones-ceer): la acción "Datos del INDEC" deja en datos/indec-estado.json la hora (UTC)
+   desde la que hay una publicación para buscar ("proxima": las 16:01 del día de difusión). Si ya pasó y la acción no
+   está corriendo, se la dispara. GitHub corre sus horarios programados con atraso; esto la hace arrancar a tiempo y
+   repetir cada 5 minutos hasta que el INDEC suba el dato. */
+const REPO_PUB = 'tadeobessega/publicaciones-ceer';
+async function dispararIndec(env) {
+  const h = { authorization: `Bearer ${env.GITHUB_TOKEN}`, accept: 'application/vnd.github+json', 'user-agent': 'panel-miembros-ceer', 'x-github-api-version': '2022-11-28' };
+  const r = await fetch(`https://api.github.com/repos/${REPO_PUB}/contents/datos/indec-estado.json?ref=main`, { headers: { ...h, accept: 'application/vnd.github.raw+json' } });
+  if (!r.ok) return;
+  const e = await r.json();
+  if (!e.proxima || new Date(e.proxima) > new Date()) return;
+  const q = await fetch(`https://api.github.com/repos/${REPO_PUB}/actions/workflows/datos-indec.yml/runs?per_page=5`, { headers: h });
+  const j = q.ok ? await q.json() : { workflow_runs: [] };
+  if ((j.workflow_runs || []).some((x) => x.status !== 'completed' && Date.now() - new Date(x.created_at) < 15 * 60e3)) return;
+  const d = await fetch(`https://api.github.com/repos/${REPO_PUB}/actions/workflows/datos-indec.yml/dispatches`, { method: 'POST', headers: h, body: JSON.stringify({ ref: 'main' }) });
+  console.log('INDEC: acción disparada', d.status);
+}
+
 export default {
   async fetch(request, env) {
     nombreToken(env);
@@ -37,8 +55,14 @@ export default {
   async scheduled(event, env, ctx) {
     nombreToken(env);
     if (!env.GITHUB_TOKEN) return;
+    const cadaCinco = event.cron !== '17 * * * *';
+    /* cada 5 minutos: dispara la actualización de los datos del INDEC si hay una publicación esperando */
+    if (cadaCinco) { try { await dispararIndec(env); } catch (e) { console.log('INDEC:', e.message); } }
+    /* los que quedaron sin acceso porque faltaba el token se revisan primero, y también en la corrida de cada 5 minutos */
     const m = await env.DB.prepare(
-      "SELECT usuario, github, activo FROM usuarios WHERE github IS NOT NULL AND github != '' ORDER BY github_revisado LIMIT 1"
+      "SELECT usuario, github, activo FROM usuarios WHERE github IS NOT NULL AND github != ''" +
+      (cadaCinco ? " AND github_estado LIKE 'Pendiente: falta configurar%'" : '') +
+      " ORDER BY (github_estado LIKE 'Pendiente: falta configurar%') DESC, github_revisado LIMIT 1"
     ).first();
     if (!m) return;
     let estado;
