@@ -11,8 +11,12 @@ const MAX_FALLOS = 5;
 const BLOQUEO_MIN = 15;
 const COOKIE = '__Host-ceer_panel';
 
+/* El secreto se cargó en Cloudflare como GITHUB_TOKEM (con M). Se acepta ese nombre para no tener que volver a generar el token. */
+function nombreToken(env) { if (!env.GITHUB_TOKEN && env.GITHUB_TOKEM) env.GITHUB_TOKEN = env.GITHUB_TOKEM; }
+
 export default {
   async fetch(request, env) {
+    nombreToken(env);
     const url = new URL(request.url);
     try {
       if (request.method === 'POST' && !mismoOrigen(request, url)) return texto('Origen no permitido', 403);
@@ -31,6 +35,7 @@ export default {
      (uno por corrida, para no pasar el límite de pedidos de Cloudflare). Así los repos nuevos
      también les llegan a todos. */
   async scheduled(event, env, ctx) {
+    nombreToken(env);
     if (!env.GITHUB_TOKEN) return;
     const m = await env.DB.prepare(
       "SELECT usuario, github, activo FROM usuarios WHERE github IS NOT NULL AND github != '' ORDER BY github_revisado LIMIT 1"
